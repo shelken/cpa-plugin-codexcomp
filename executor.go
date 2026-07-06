@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -165,6 +166,13 @@ func executeStream(raw []byte) ([]byte, error) {
 				closeStream(streamID, fmt.Sprintf("fold panic: %v", recovered))
 			}
 		}()
+		emitChunk(streamID, sseEvent(map[string]any{
+			"type": "response.in_progress",
+			"response": map[string]any{
+				"id":     fmt.Sprintf("resp_codexcomp_%d", time.Now().UnixNano()),
+				"status": "in_progress",
+			},
+		}))
 		runFold(baseBody, origInput, req, streamID)
 		closeStream(streamID, "")
 	}()
