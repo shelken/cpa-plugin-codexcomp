@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -34,10 +33,6 @@ type hostModelStreamReadResponse struct {
 	Done    bool   `json:"done"`
 }
 
-type streamChunkOutput struct {
-	Payload []byte `json:"payload"`
-}
-
 type streamEmitRequest struct {
 	StreamID string `json:"stream_id"`
 	Payload  []byte `json:"payload"`
@@ -49,14 +44,15 @@ type streamCloseRequest struct {
 	Error    string `json:"error,omitempty"`
 }
 
-func emitChunk(streamID string, payload []byte) {
+func emitChunk(streamID string, payload []byte) error {
 	if streamID == "" || len(payload) == 0 {
-		return
+		return nil
 	}
-	_, _ = callHost(pluginabi.MethodHostStreamEmit, streamEmitRequest{
+	_, err := callHost(pluginabi.MethodHostStreamEmit, streamEmitRequest{
 		StreamID: streamID,
 		Payload:  payload,
 	})
+	return err
 }
 
 func closeStream(streamID, errMsg string) {
@@ -66,20 +62,11 @@ func closeStream(streamID, errMsg string) {
 	_, _ = callHost(pluginabi.MethodHostStreamClose, streamCloseRequest{StreamID: streamID, Error: errMsg})
 }
 
-type streamResponseOutput struct {
-	Headers http.Header         `json:"headers,omitempty"`
-	Chunks  []streamChunkOutput `json:"chunks,omitempty"`
-}
-
-// routeModel decides whether to intercept this request.
-// We only handle gpt-5.5 streaming Responses API requests.
 func routeModel(raw []byte) ([]byte, error) {
 	var req rpcModelRouteRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, fmt.Errorf("decode model.route request: %w", err)
 	}
-
-	pluginLog("info", fmt.Sprintf("routeModel: model=%s source=%s stream=%v", req.RequestedModel, req.SourceFormat, req.Stream))
 
 	if req.RequestedModel != "gpt-5.5" {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
@@ -87,8 +74,27 @@ func routeModel(raw []byte) ([]byte, error) {
 	if req.SourceFormat != "openai-response" {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
 	}
+	if !req.Stream {
+		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
+	}
 
-	pluginLog("info", "routeModel: handling gpt-5.5 responses request")
+	var body map[string]any
+	if err := json.Unmarshal(req.Body, &body); err != nil {
+		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
+	}
+
+	if _, hasPRI := body["previous_response_id"]; hasPRI {
+		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
+	}
+
+	input, ok := body["input"]
+	if !ok {
+		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
+	}
+	if _, isArray := input.([]any); !isArray {
+		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
+	}
+
 	return okEnvelope(pluginapi.ModelRouteResponse{
 		Handled:    true,
 		TargetKind: pluginapi.ModelRouteTargetSelf,
@@ -96,7 +102,6 @@ func routeModel(raw []byte) ([]byte, error) {
 	})
 }
 
-// execute handles non-streaming requests by falling back to host.model.execute.
 func execute(raw []byte) ([]byte, error) {
 	var req rpcExecutorRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -116,6 +121,7 @@ func execute(raw []byte) ([]byte, error) {
 		Body:           body,
 		Headers:        cloneHeader(req.Headers),
 		Query:          req.Query,
+		Alt:            req.Alt,
 		HostCallbackID: req.HostCallbackID,
 	})
 	if err != nil {
@@ -129,9 +135,6 @@ func execute(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: resp.Body, Headers: resp.Headers})
 }
 
-// executeStream is the core fold logic: send the request upstream via
-// host.model.execute_stream, read chunks, detect 518n-2 truncation,
-// continue if needed, and fold all rounds into one response.
 func executeStream(raw []byte) ([]byte, error) {
 	var req rpcExecutorRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -150,7 +153,9 @@ func executeStream(raw []byte) ([]byte, error) {
 	}
 	if err := json.Unmarshal(bodyBytes, &baseBody); err != nil {
 		closeStream(streamID, "decode request body: "+err.Error())
-		return nil, fmt.Errorf("decode request body: %w", err)
+		return okEnvelope(map[string]any{
+			"headers": http.Header{"Content-Type": []string{"text/event-stream"}},
+		})
 	}
 
 	origInput, _ := baseBody["input"].([]any)
@@ -166,13 +171,6 @@ func executeStream(raw []byte) ([]byte, error) {
 				closeStream(streamID, fmt.Sprintf("fold panic: %v", recovered))
 			}
 		}()
-		emitChunk(streamID, sseEvent(map[string]any{
-			"type": "response.in_progress",
-			"response": map[string]any{
-				"id":     fmt.Sprintf("resp_codexcomp_%d", time.Now().UnixNano()),
-				"status": "in_progress",
-			},
-		}))
 		runFold(baseBody, origInput, req, streamID)
 		closeStream(streamID, "")
 	}()
@@ -183,77 +181,103 @@ func executeStream(raw []byte) ([]byte, error) {
 }
 
 func runFold(baseBody map[string]any, origInput []any, req rpcExecutorRequest, streamID string) {
-	foldState := newFoldState(baseBody, origInput, req, req.HostCallbackID)
+	fs := newFoldState(baseBody, origInput, req, req.HostCallbackID)
 
 	for {
-		roundChunks, _, terminal, usage, roundErr := foldState.openRound()
-		if roundErr != nil {
-			if foldState.roundNo == 0 {
-				emitChunk(streamID, sseEvent(failedEvent(502, roundErr.Error())))
-				return
-			}
-			emitChunk(streamID, sseEvent(foldState.incompleteEvent("upstream_error")))
-			return
-		}
+		terminal, usage, _, roundErr := fs.openRound(streamID)
 
-		for _, ch := range roundChunks {
-			emitChunk(streamID, ch.Payload)
+		if roundErr != nil {
+			var fev map[string]any
+			if _, isMid := roundErr.(*midStreamError); isMid {
+				fev = fs.incompleteEvent("upstream_error")
+			} else if fs.roundNo == 1 {
+				status := 502
+				if ue, ok := roundErr.(*upstreamError); ok {
+					status = ue.status
+				}
+				fev = failedEvent(status, roundErr.Error())
+			} else {
+				fev = fs.incompleteEvent("upstream_error")
+			}
+			fs.stamp(fev)
+			_ = emitChunk(streamID, sseEvent(fev))
+			_ = emitDone(streamID)
+			return
 		}
 
 		if terminal == nil {
-			emitChunk(streamID, sseEvent(foldState.incompleteEvent("upstream_eof")))
+			iev := fs.incompleteEvent("upstream_eof")
+			fs.stamp(iev)
+			_ = emitChunk(streamID, sseEvent(iev))
+			_ = emitDone(streamID)
 			return
 		}
 
-		foldState.endRound(terminal, usage)
+		fs.endRound(terminal, usage)
 
-		if foldState.shouldContinue() {
-			if err := foldState.prepareNextRound(); err != nil {
-				emitChunk(streamID, sseEvent(foldState.incompleteEvent("upstream_error")))
-				return
-			}
+		if fs.shouldContinue() {
+			fs.prepareNextRound()
 			continue
 		}
 
-		flushChunks := foldState.flushCleanStop()
-		for _, ch := range flushChunks {
-			emitChunk(streamID, ch.Payload)
+		if err := fs.flushCleanStop(streamID); err != nil {
+			_ = emitDone(streamID)
+			return
 		}
-		emitChunk(streamID, sseEvent(foldState.terminalEvent()))
+		ev := fs.terminalEvent()
+		fs.stamp(ev)
+		if err := emitChunk(streamID, sseEvent(ev)); err != nil {
+			return
+		}
+		_ = emitDone(streamID)
 		return
 	}
 }
 
-// sseEvent serializes an event dict as an SSE data line.
+func emitDone(streamID string) error {
+	return emitChunk(streamID, []byte("data: [DONE]\n\n"))
+}
+
+type upstreamError struct {
+	status int
+	msg    string
+}
+
+func (e *upstreamError) Error() string { return e.msg }
+
+type midStreamError struct{ msg string }
+
+func (e *midStreamError) Error() string { return e.msg }
+
 func sseEvent(ev map[string]any) []byte {
 	raw, _ := json.Marshal(ev)
 	return append([]byte("data: "), append(raw, '\n', '\n')...)
 }
 
-// foldState tracks the state across multiple rounds of the fold.
 type foldState struct {
-	baseBody      map[string]any
-	origInput     []any
-	req           rpcExecutorRequest
+	baseBody       map[string]any
+	origInput      []any
+	req            rpcExecutorRequest
 	hostCallbackID string
 
-	roundNo        int
-	dsOI           int
-	seq            int
-	baseResponse   map[string]any
-	finalOutput    []map[string]any
-	replayTail     []any
-	summedUsage    map[string]any
-	firstUsage     map[string]any
-	roundsInfo     []map[string]any
+	roundNo      int
+	dsOI         int
+	seq          int
+	baseResponse map[string]any
+	finalOutput  []map[string]any
+	replayTail   []any
+	summedUsage  map[string]any
+	firstUsage   map[string]any
+	roundsInfo   []map[string]any
 
-	// per-round state
 	roundReasoning []map[string]any
 	kind           map[int]string
 	oiToDS         map[int]int
 	buffered       []bufferedEntry
 	terminal       map[string]any
 	usage          map[string]any
+
+	sseBuffer []byte
 }
 
 type bufferedEntry struct {
@@ -274,9 +298,7 @@ func newFoldState(baseBody map[string]any, origInput []any, req rpcExecutorReque
 	}
 }
 
-// openRound sends the request upstream and reads all chunks.
-// Returns: downstream chunks, headers, terminal event, usage, error.
-func (fs *foldState) openRound() ([]streamChunkOutput, http.Header, map[string]any, map[string]any, error) {
+func (fs *foldState) openRound(streamID string) (map[string]any, map[string]any, http.Header, error) {
 	fs.roundNo++
 	fs.roundReasoning = nil
 	fs.kind = map[int]string{}
@@ -284,16 +306,13 @@ func (fs *foldState) openRound() ([]streamChunkOutput, http.Header, map[string]a
 	fs.buffered = nil
 	fs.terminal = nil
 	fs.usage = nil
+	fs.sseBuffer = nil
 
 	var bodyBytes []byte
 	var err error
-	if fs.roundNo == 1 {
-		bodyBytes, err = json.Marshal(fs.baseBody)
-	} else {
-		bodyBytes, err = json.Marshal(nextRoundBody(fs.baseBody, append(fs.origInput, fs.replayTail...)))
-	}
+	bodyBytes, err = json.Marshal(nextRoundBody(fs.baseBody, append(fs.origInput, fs.replayTail...)))
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	result, err := callHost(pluginabi.MethodHostModelExecuteStream, hostModelExecRequest{
@@ -304,140 +323,257 @@ func (fs *foldState) openRound() ([]streamChunkOutput, http.Header, map[string]a
 		Body:           bodyBytes,
 		Headers:        cloneHeader(fs.req.Headers),
 		Query:          fs.req.Query,
+		Alt:            fs.req.Alt,
 		HostCallbackID: fs.hostCallbackID,
 	})
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	var streamResp hostModelStreamResponse
 	if err := json.Unmarshal(result, &streamResp); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("decode host.model.execute_stream result: %w", err)
+		return nil, nil, nil, fmt.Errorf("decode host.model.execute_stream result: %w", err)
+	}
+	if streamResp.StatusCode >= 400 {
+		if streamResp.StreamID != "" {
+			_, _ = callHost(pluginabi.MethodHostModelStreamClose, map[string]any{"stream_id": streamResp.StreamID})
+		}
+		return nil, nil, nil, &upstreamError{status: streamResp.StatusCode, msg: fmt.Sprintf("upstream returned status %d", streamResp.StatusCode)}
 	}
 	if streamResp.StreamID == "" {
-		return nil, nil, nil, nil, fmt.Errorf("host.model.execute_stream returned empty stream_id")
+		return nil, nil, nil, fmt.Errorf("host.model.execute_stream returned empty stream_id")
 	}
 	defer func() {
 		_, _ = callHost(pluginabi.MethodHostModelStreamClose, map[string]any{"stream_id": streamResp.StreamID})
 	}()
 
-	var chunks []streamChunkOutput
 	for {
 		readResult, err := callHost(pluginabi.MethodHostModelStreamRead, map[string]any{"stream_id": streamResp.StreamID})
 		if err != nil {
-			return chunks, streamResp.Headers, nil, nil, err
+			return nil, nil, streamResp.Headers, &midStreamError{msg: err.Error()}
 		}
 		var readResp hostModelStreamReadResponse
 		if err := json.Unmarshal(readResult, &readResp); err != nil {
-			return chunks, streamResp.Headers, nil, nil, err
+			return nil, nil, streamResp.Headers, &midStreamError{msg: err.Error()}
 		}
 		if len(readResp.Payload) > 0 {
-			processed, term := fs.processChunk(readResp.Payload)
-			chunks = append(chunks, processed...)
+			term, perr := fs.processAndEmit(readResp.Payload, streamID)
+			if perr != nil {
+				return nil, nil, streamResp.Headers, &midStreamError{msg: perr.Error()}
+			}
 			if term != nil {
-				return chunks, streamResp.Headers, term, fs.usage, nil
+				return fs.terminal, fs.usage, streamResp.Headers, nil
 			}
 		}
 		if readResp.Error != "" {
-			return chunks, streamResp.Headers, nil, nil, fmt.Errorf("%s", readResp.Error)
+			return nil, nil, streamResp.Headers, &midStreamError{msg: readResp.Error}
 		}
 		if readResp.Done {
-			return chunks, streamResp.Headers, fs.terminal, fs.usage, nil
+			return fs.terminal, fs.usage, streamResp.Headers, nil
 		}
 	}
 }
 
-// processChunk parses SSE events from a raw payload and classifies them.
-// Returns downstream chunks to emit and a terminal event if found.
-func (fs *foldState) processChunk(payload []byte) ([]streamChunkOutput, map[string]any) {
-	var chunks []streamChunkOutput
-	events := parseSSEEvents(payload)
-	for _, ev := range events {
-		etype, _ := ev["type"].(string)
+const maxSSEBufferSize = 8 * 1024 * 1024
 
-		if etype == "response.created" || etype == "response.in_progress" {
-			if fs.roundNo == 1 {
-				if etype == "response.created" {
-					if r, ok := ev["response"].(map[string]any); ok {
-						fs.baseResponse = r
-					}
-				}
-				fs.stamp(ev)
-				raw, _ := json.Marshal(ev)
-				chunks = append(chunks, streamChunkOutput{Payload: append([]byte("data: "), append(raw, '\n', '\n')...)})
-			}
+// CPA's stream_read returns payload chunks without trailing newlines, so we
+// cannot rely on \n or \n\n to delimit SSE frames. We scan for "data:" prefixes
+// and balance JSON braces to find event boundaries instead.
+func (fs *foldState) processAndEmit(payload []byte, streamID string) (map[string]any, error) {
+	fs.sseBuffer = append(fs.sseBuffer, payload...)
+	if len(fs.sseBuffer) > maxSSEBufferSize {
+		return nil, fmt.Errorf("sse buffer exceeded %d bytes", maxSSEBufferSize)
+	}
+
+	for {
+		dataStart := findSubstring(fs.sseBuffer, []byte("data:"))
+		if dataStart < 0 {
+			break
+		}
+		jsonStart := dataStart + 5
+		for jsonStart < len(fs.sseBuffer) && (fs.sseBuffer[jsonStart] == ' ' || fs.sseBuffer[jsonStart] == '\t') {
+			jsonStart++
+		}
+		if jsonStart >= len(fs.sseBuffer) {
+			break
+		}
+
+		if jsonStart+5 <= len(fs.sseBuffer) && string(fs.sseBuffer[jsonStart:jsonStart+5]) == "[DONE]" {
+			fs.sseBuffer = fs.sseBuffer[jsonStart+5:]
 			continue
 		}
 
-		if terminalTypes[etype] {
-			fs.terminal = ev
-			if r, ok := ev["response"].(map[string]any); ok {
-				if u, ok := r["usage"].(map[string]any); ok {
-					fs.usage = u
-				}
-			}
-			return chunks, ev
-		}
-
-		oi := -1
-		if v, ok := ev["output_index"].(float64); ok {
-			oi = int(v)
-		}
-
-		if etype == "response.output_item.added" {
-			item, _ := ev["item"].(map[string]any)
-			if item == nil {
-				item = map[string]any{}
-			}
-			itemType, _ := item["type"].(string)
-			if itemType == "reasoning" {
-				fs.kind[oi] = "reasoning"
-				fs.oiToDS[oi] = fs.dsOI
-				ev["output_index"] = fs.dsOI
-				fs.dsOI++
-				fs.stamp(ev)
-				raw, _ := json.Marshal(ev)
-				chunks = append(chunks, streamChunkOutput{Payload: append([]byte("data: "), append(raw, '\n', '\n')...)})
-			} else {
-				fs.kind[oi] = "buffered"
-				fs.buffered = append(fs.buffered, bufferedEntry{oi: oi, item: item, events: []map[string]any{ev}})
-			}
+		if fs.sseBuffer[jsonStart] != '{' {
+			fs.sseBuffer = fs.sseBuffer[dataStart+5:]
 			continue
 		}
 
-		k := fs.kind[oi]
-		if k == "reasoning" {
-			if ds, ok := fs.oiToDS[oi]; ok {
-				ev["output_index"] = ds
-			}
-			if etype == "response.output_item.done" {
-				if item, ok := ev["item"].(map[string]any); ok {
-					fs.roundReasoning = append(fs.roundReasoning, item)
-					fs.finalOutput = append(fs.finalOutput, item)
-				}
-			}
-			fs.stamp(ev)
-			raw, _ := json.Marshal(ev)
-			chunks = append(chunks, streamChunkOutput{Payload: append([]byte("data: "), append(raw, '\n', '\n')...)})
-		} else if k == "buffered" {
-			for i := range fs.buffered {
-				if fs.buffered[i].oi == oi {
-					fs.buffered[i].events = append(fs.buffered[i].events, ev)
-					if etype == "response.output_item.done" {
-						if item, ok := ev["item"].(map[string]any); ok {
-							fs.buffered[i].item = item
-						}
-					}
-					break
-				}
-			}
-		} else {
-			fs.stamp(ev)
-			raw, _ := json.Marshal(ev)
-			chunks = append(chunks, streamChunkOutput{Payload: append([]byte("data: "), append(raw, '\n', '\n')...)})
+		jsonEnd := findJSONEnd(fs.sseBuffer, jsonStart)
+		if jsonEnd < 0 {
+			break
+		}
+
+		dataBytes := fs.sseBuffer[jsonStart : jsonEnd+1]
+		fs.sseBuffer = fs.sseBuffer[jsonEnd+1:]
+
+		var ev map[string]any
+		if err := json.Unmarshal(dataBytes, &ev); err != nil {
+			return nil, fmt.Errorf("parse SSE data: %w", err)
+		}
+
+		term, err := fs.processEvent(ev, streamID)
+		if err != nil {
+			return nil, err
+		}
+		if term != nil {
+			return term, nil
 		}
 	}
-	return chunks, nil
+
+	return nil, nil
+}
+
+func findSubstring(data, sub []byte) int {
+	if len(sub) == 0 || len(data) < len(sub) {
+		return -1
+	}
+	for i := 0; i <= len(data)-len(sub); i++ {
+		match := true
+		for j := 0; j < len(sub); j++ {
+			if data[i+j] != sub[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+func findJSONEnd(data []byte, start int) int {
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(data); i++ {
+		c := data[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if c == '{' {
+			depth++
+		} else if c == '}' {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func (fs *foldState) processEvent(ev map[string]any, streamID string) (map[string]any, error) {
+	etype, _ := ev["type"].(string)
+
+	if etype == "response.created" || etype == "response.in_progress" {
+		if fs.roundNo == 1 {
+			if etype == "response.created" {
+				if r, ok := ev["response"].(map[string]any); ok {
+					fs.baseResponse = r
+				}
+			}
+			fs.stamp(ev)
+			if err := emitChunk(streamID, sseEvent(ev)); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	}
+
+	if terminalTypes[etype] {
+		fs.terminal = ev
+		if r, ok := ev["response"].(map[string]any); ok {
+			if u, ok := r["usage"].(map[string]any); ok {
+				fs.usage = u
+			}
+		}
+		return ev, nil
+	}
+
+	oi := -1
+	if v, ok := ev["output_index"].(float64); ok {
+		oi = int(v)
+	}
+
+	if etype == "response.output_item.added" {
+		item, _ := ev["item"].(map[string]any)
+		if item == nil {
+			item = map[string]any{}
+		}
+		itemType, _ := item["type"].(string)
+		if itemType == "reasoning" {
+			fs.kind[oi] = "reasoning"
+			fs.oiToDS[oi] = fs.dsOI
+			ev["output_index"] = fs.dsOI
+			fs.dsOI++
+			fs.stamp(ev)
+			if err := emitChunk(streamID, sseEvent(ev)); err != nil {
+				return nil, err
+			}
+		} else {
+			fs.kind[oi] = "buffered"
+			fs.buffered = append(fs.buffered, bufferedEntry{oi: oi, item: item, events: []map[string]any{ev}})
+		}
+		return nil, nil
+	}
+
+	k := fs.kind[oi]
+	if k == "reasoning" {
+		if ds, ok := fs.oiToDS[oi]; ok {
+			ev["output_index"] = ds
+		}
+		if etype == "response.output_item.done" {
+			if item, ok := ev["item"].(map[string]any); ok {
+				fs.roundReasoning = append(fs.roundReasoning, item)
+				fs.finalOutput = append(fs.finalOutput, item)
+			}
+		}
+		fs.stamp(ev)
+		if err := emitChunk(streamID, sseEvent(ev)); err != nil {
+			return nil, err
+		}
+	} else if k == "buffered" {
+		for i := range fs.buffered {
+			if fs.buffered[i].oi == oi {
+				fs.buffered[i].events = append(fs.buffered[i].events, ev)
+				if etype == "response.output_item.done" {
+					if item, ok := ev["item"].(map[string]any); ok {
+						fs.buffered[i].item = item
+					}
+				}
+				break
+			}
+		}
+	} else {
+		fs.stamp(ev)
+		if err := emitChunk(streamID, sseEvent(ev)); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
 }
 
 func (fs *foldState) stamp(ev map[string]any) {
@@ -445,7 +581,6 @@ func (fs *foldState) stamp(ev map[string]any) {
 	fs.seq++
 }
 
-// endRound processes the end of a round: accumulate usage, check truncation.
 func (fs *foldState) endRound(terminal map[string]any, usage map[string]any) {
 	fs.terminal = terminal
 	fs.usage = usage
@@ -463,9 +598,12 @@ func (fs *foldState) endRound(terminal map[string]any, usage map[string]any) {
 	})
 }
 
-// shouldContinue returns true when a continuation round should be opened.
 func (fs *foldState) shouldContinue() bool {
 	if fs.terminal == nil {
+		return false
+	}
+	etype, _ := fs.terminal["type"].(string)
+	if etype != "response.completed" {
 		return false
 	}
 	rt := reasoningTokens(fs.usage)
@@ -473,32 +611,23 @@ func (fs *foldState) shouldContinue() bool {
 	if !inContinueWindow(n) {
 		return false
 	}
-	hasEnc := false
-	if len(fs.roundReasoning) > 0 {
-		if _, ok := fs.roundReasoning[len(fs.roundReasoning)-1]["encrypted_content"]; ok {
-			hasEnc = true
-		}
-	}
-	if !hasEnc {
+	if !fs.hasEncryptedContent() {
 		return false
 	}
 	return fs.roundNo <= maxContinue
 }
 
-// stoppedReason returns the reason the fold stopped, if non-natural.
 func (fs *foldState) stoppedReason() string {
+	etype, _ := fs.terminal["type"].(string)
+	if etype != "response.completed" {
+		return ""
+	}
 	rt := reasoningTokens(fs.usage)
 	n := tierN(rt)
 	if n == nil {
 		return ""
 	}
-	hasEnc := false
-	if len(fs.roundReasoning) > 0 {
-		if _, ok := fs.roundReasoning[len(fs.roundReasoning)-1]["encrypted_content"]; ok {
-			hasEnc = true
-		}
-	}
-	if !hasEnc {
+	if !fs.hasEncryptedContent() {
 		return "no_encrypted_content"
 	}
 	if fs.roundNo > maxContinue {
@@ -507,36 +636,41 @@ func (fs *foldState) stoppedReason() string {
 	return "tier_out_of_window"
 }
 
-// prepareNextRound builds the replay tail for the continuation round.
-func (fs *foldState) prepareNextRound() error {
+func (fs *foldState) hasEncryptedContent() bool {
+	if len(fs.roundReasoning) == 0 {
+		return false
+	}
+	last := fs.roundReasoning[len(fs.roundReasoning)-1]
+	s, ok := last["encrypted_content"].(string)
+	return ok && s != ""
+}
+
+func (fs *foldState) prepareNextRound() {
 	tail := make([]any, 0, len(fs.roundReasoning)+1)
 	for _, r := range fs.roundReasoning {
 		tail = append(tail, r)
 	}
 	tail = append(tail, commentaryNudge())
 	fs.replayTail = append(fs.replayTail, tail...)
-	return nil
 }
 
-// flushCleanStop emits the buffered output from the clean round as downstream chunks.
-func (fs *foldState) flushCleanStop() []streamChunkOutput {
-	var chunks []streamChunkOutput
+func (fs *foldState) flushCleanStop(streamID string) error {
 	for _, entry := range fs.buffered {
 		for _, ev := range entry.events {
 			if _, ok := ev["output_index"]; ok {
 				ev["output_index"] = fs.dsOI
 			}
 			fs.stamp(ev)
-			raw, _ := json.Marshal(ev)
-			chunks = append(chunks, streamChunkOutput{Payload: append([]byte("data: "), append(raw, '\n', '\n')...)})
+			if err := emitChunk(streamID, sseEvent(ev)); err != nil {
+				return err
+			}
 		}
 		fs.dsOI++
 		fs.finalOutput = append(fs.finalOutput, entry.item)
 	}
-	return chunks
+	return nil
 }
 
-// terminalEvent builds the final terminal event for the fold.
 func (fs *foldState) terminalEvent() map[string]any {
 	return terminalEvent(
 		fs.terminal,
@@ -550,7 +684,6 @@ func (fs *foldState) terminalEvent() map[string]any {
 	)
 }
 
-// incompleteEvent builds a synthesized degraded-stop terminal event.
 func (fs *foldState) incompleteEvent(reason string) map[string]any {
 	return terminalEvent(
 		nil,
@@ -562,43 +695,4 @@ func (fs *foldState) incompleteEvent(reason string) map[string]any {
 		reason,
 		reason,
 	)
-}
-
-// parseSSEEvents extracts JSON event dicts from an SSE payload.
-func parseSSEEvents(payload []byte) []map[string]any {
-	var events []map[string]any
-	lines := splitLines(payload)
-	for _, line := range lines {
-		if len(line) <= 6 {
-			continue
-		}
-		if string(line[:6]) != "data: " {
-			continue
-		}
-		data := line[6:]
-		if string(data) == "[DONE]" {
-			continue
-		}
-		var ev map[string]any
-		if err := json.Unmarshal(data, &ev); err != nil {
-			continue
-		}
-		events = append(events, ev)
-	}
-	return events
-}
-
-func splitLines(data []byte) [][]byte {
-	var lines [][]byte
-	start := 0
-	for i, b := range data {
-		if b == '\n' {
-			lines = append(lines, data[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(data) {
-		lines = append(lines, data[start:])
-	}
-	return lines
 }

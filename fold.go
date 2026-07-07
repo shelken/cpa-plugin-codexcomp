@@ -8,12 +8,12 @@ import (
 
 // fold constants — mirror codexcomp/fold.py
 const (
-	step         = 518
-	minN         = 1
-	maxN         = 6
-	maxContinue  = 3
-	encInclude   = "reasoning.encrypted_content"
-	markerText   = "Continue thinking..."
+	step        = 518
+	minN        = 1
+	maxN        = 6
+	maxContinue = 3
+	encInclude  = "reasoning.encrypted_content"
+	markerText  = "Continue thinking..."
 )
 
 var terminalTypes = map[string]bool{
@@ -97,7 +97,7 @@ func nextRoundBody(baseBody map[string]any, inputItems []any) map[string]any {
 	body["input"] = inputItems
 
 	includeRaw, _ := body["include"].([]any)
-	include := make([]string, 0, len(includeRaw)+1)
+	include := make([]any, 0, len(includeRaw)+1)
 	for _, x := range includeRaw {
 		if s, ok := x.(string); ok {
 			include = append(include, s)
@@ -302,13 +302,13 @@ func toFloat(v any) float64 {
 
 // hostModelExecRequest is the request sent to host.model.execute_stream.
 type hostModelExecRequest struct {
-	EntryProtocol string      `json:"entry_protocol"`
-	ExitProtocol  string      `json:"exit_protocol"`
-	Model         string      `json:"model"`
-	Stream        bool        `json:"stream"`
-	Body          []byte      `json:"body"`
-	Headers       http.Header `json:"headers,omitempty"`
-	Query         url.Values  `json:"query,omitempty"`
-	Alt           string      `json:"alt,omitempty"`
-	HostCallbackID string     `json:"host_callback_id,omitempty"`
+	EntryProtocol  string      `json:"entry_protocol"`
+	ExitProtocol   string      `json:"exit_protocol"`
+	Model          string      `json:"model"`
+	Stream         bool        `json:"stream"`
+	Body           []byte      `json:"body"`
+	Headers        http.Header `json:"headers,omitempty"`
+	Query          url.Values  `json:"query,omitempty"`
+	Alt            string      `json:"alt,omitempty"`
+	HostCallbackID string      `json:"host_callback_id,omitempty"`
 }

@@ -83,7 +83,17 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 }
 
 //export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (ret C.int) {
+	defer func() {
+		if r := recover(); r != nil {
+			if response != nil {
+				response.ptr = nil
+				response.len = 0
+			}
+			writeResponse(response, errorEnvelope("plugin_panic", fmt.Sprintf("%v", r)))
+			ret = 1
+		}
+	}()
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
