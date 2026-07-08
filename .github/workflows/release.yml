@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*'
@@ -28,15 +29,6 @@ jobs:
       - name: Install ARM64 cross-compiler
         if: matrix.goarch == 'arm64'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Clone CLIProxyAPI SDK (latest release)
-        run: |
-          CPA_TAG=$(curl -s https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])")
-          echo "Cloning CPA $CPA_TAG"
-          git clone --depth 1 --branch "$CPA_TAG" https://github.com/router-for-me/CLIProxyAPI.git /tmp/CLIProxyAPI
-
-      - name: Replace SDK path
-        run: sed -i "s|../CLIProxyAPI|/tmp/CLIProxyAPI|g" go.mod
 
       - name: Build
         env:
@@ -76,14 +68,10 @@ jobs:
         working-directory: artifacts
         run: sha256sum codexcomp_*.zip > checksums.txt
 
-      - name: Read tag message
-        id: tagmsg
-        run: git tag -l --format='%(contents)' ${{ github.ref_name }} > /tmp/release_notes.md
-
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: /tmp/release_notes.md
+          generate_release_notes: true
           files: |
             artifacts/codexcomp_*.zip
             artifacts/checksums.txt
