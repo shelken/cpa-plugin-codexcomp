@@ -187,8 +187,8 @@ func pluginRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             pluginIdentifier,
 			Version:          pluginVersion,
-			Author:           "uf-hy",
-			GitHubRepository: "https://github.com/uf-hy/cpa-plugin-codexcomp",
+			Author:           "shelken",
+			GitHubRepository: "https://github.com/shelken/cpa-plugin-codexcomp",
 			ConfigFields: []pluginapi.ConfigField{
 				{
 					Name:        "marker_text",

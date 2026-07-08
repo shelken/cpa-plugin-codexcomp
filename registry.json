@@ -5,9 +5,10 @@
       "id": "codexcomp",
       "name": "CodexComp",
       "description": "Detects and repairs gpt-5.5 reasoning truncation in streaming requests, continuing reasoning automatically to reduce occasional model degradation",
-      "author": "uf-hy",
-      "repository": "https://github.com/uf-hy/cpa-plugin-codexcomp",
-      "homepage": "https://github.com/uf-hy/cpa-plugin-codexcomp",
+      "author": "shelken",
+      "version": "0.1.2",
+      "repository": "https://github.com/shelken/cpa-plugin-codexcomp",
+      "homepage": "https://github.com/shelken/cpa-plugin-codexcomp",
       "license": "MIT",
       "tags": ["executor", "codex"]
     }
